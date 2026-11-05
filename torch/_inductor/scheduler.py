@@ -62,7 +62,7 @@ from .comm_analysis import (
     estimate_nccl_collective_runtime_nccl_estimator,
 )
 from .dependencies import Dep, MemoryDep, StarDep, WeakDep
-from .exc import GPUTooOldForTriton, TritonMissing
+from .exc import GPUTooOldForTriton, NonLinearIndexingError, TritonMissing
 from .fx_utils import count_flops_fx
 from .ir import (
     assign_origin_node,
@@ -96,6 +96,7 @@ from .utils import (
     is_collective,
     is_cudagraph_unsafe_op,
     is_gpu,
+    is_linear_indexing,
     is_multi_outputs_template,
     is_output_of_multi_outputs_template,
     is_wait,
@@ -303,13 +304,39 @@ class MixOrderReduction:
 
     @staticmethod
     def is_split_reduction(node: BaseSchedulerNode) -> bool:
-        return node.is_reduction() and all(
-            subnode.node._split_size is not None
-            for subnode in node.get_nodes()
-            if isinstance(subnode, SchedulerNode)
-            and subnode.is_reduction()
-            and isinstance(subnode.node, ComputedBuffer)
-        )
+        """
+        Whether node is (a fusion of) the first stage of split reductions
+        that can be re-derived from one original reduction. First stages of
+        reductions with different original shapes can still be fused when
+        their split loops coincide (a per-channel and a per-sample reduction
+        both split along the spatial dims); such a node is not one.
+        """
+        if not node.is_reduction():
+            return False
+        originals: OrderedSet[tuple[sympy.Expr, sympy.Expr]] = OrderedSet()
+        for subnode in node.get_nodes():
+            if not (
+                isinstance(subnode, SchedulerNode)
+                and subnode.is_reduction()
+                and isinstance(subnode.node, ComputedBuffer)
+            ):
+                continue
+            buf = subnode.node
+            if (
+                buf._split_size is None
+                or buf._original_ranges is None
+                or buf._original_reduction_ranges is None
+            ):
+                return False
+            originals.add(
+                (
+                    V.graph.sizevars.simplify(sympy_product(buf._original_ranges)),
+                    V.graph.sizevars.simplify(
+                        sympy_product(buf._original_reduction_ranges)
+                    ),
+                )
+            )
+        return len(originals) <= 1
 
     @staticmethod
     def supports_noncontiguous_reductions(node: BaseSchedulerNode) -> bool:
@@ -3839,6 +3866,17 @@ class SchedulerNode(BaseSchedulerNode):
                     self._body, *self._sizes, normalize=should_normalize
                 )
             )
+        if config.test_configs.raise_on_modular_indexing:
+            self._check_linear_indexing(self.node)
+
+    def _check_linear_indexing(self, node: ir.Operation) -> None:
+        for dep in self.read_writes.reads_and_writes():
+            if isinstance(dep, MemoryDep) and not is_linear_indexing(dep.index):
+                origins = ", ".join(f"{o.name}={o.target}" for o in node.get_origins())
+                raise NonLinearIndexingError(
+                    f"non-linear indexing in {self.get_name()}: {dep!r}\n"
+                    f"origins: {origins}\n{self.debug_str()}"
+                )
 
     def recompute_size_and_body(
         self,

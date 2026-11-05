@@ -282,7 +282,9 @@ class TestNativeRTDevice(TestCase):
         True,
         "nativert has no XPU support: https://github.com/intel/torch-xpu-ops/issues/5364",
     )
-    @skipIf(not HAS_TRITON, "AOTI on an accelerator requires triton", device_type="cuda")
+    @skipIf(
+        not HAS_TRITON, "AOTI on an accelerator requires triton", device_type="cuda"
+    )
     @parametrize(
         "make_model",
         [_single_output_model, _multi_output_model, _pytree_model],

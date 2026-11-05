@@ -1089,6 +1089,50 @@ class TestSDPAPatternRewriterTemplate(TestCase):
         )
         self.assertEqual(counters["inductor"]["fuse_attention"], 0)
 
+    def _test_pattern_fails_with_zero_scale(self):
+        # https://github.com/pytorch/pytorch/issues/195591
+        def model(query, key, value):
+            scores = query @ key.transpose(-2, -1) / 0.0
+            return torch.softmax(scores, dim=-1) @ value
+
+        tensor_shape = (2, 4, 4, 4)
+        args = [
+            torch.randn(tensor_shape, device=self.device),
+            torch.randn(tensor_shape, device=self.device),
+            torch.randn(tensor_shape, device=self.device),
+        ]
+        self._check_common(model, args1=args, contains=False, has_fuse_pattern=False)
+        self.assertEqual(counters["inductor"]["fuse_attention"], 0)
+
+    def _test_pattern_fails_with_masked_zero_scale(self):
+        # https://github.com/pytorch/pytorch/issues/195591
+        def model(query, key, value, attn_mask):
+            scores = query @ key.transpose(-2, -1) / 0.0 + attn_mask
+            return torch.softmax(scores, dim=-1) @ value
+
+        tensor_shape = (2, 4, 4, 4)
+        args = [
+            torch.randn(tensor_shape, device=self.device),
+            torch.randn(tensor_shape, device=self.device),
+            torch.randn(tensor_shape, device=self.device),
+            torch.rand((1, 1, 4, 4), device=self.device) > 0.5,
+        ]
+        self._check_common(model, args1=args, contains=False, has_fuse_pattern=False)
+        self.assertEqual(counters["inductor"]["fuse_attention"], 0)
+
+    def _test_pattern_fuses_with_mul_zero_scale(self):
+        def model(query, key, value):
+            scores = query @ key.transpose(-2, -1) * 0.0
+            return torch.softmax(scores, dim=-1) @ value
+
+        tensor_shape = (2, 4, 4, 4)
+        args = [
+            torch.randn(tensor_shape, device=self.device),
+            torch.randn(tensor_shape, device=self.device),
+            torch.randn(tensor_shape, device=self.device),
+        ]
+        self._check_common(model, args1=args, contains=False)
+
     def _test_pattern_fails_with_unsupported_mask(self):
         if not self.use_static_shapes:
             self.skipTest("Causes shape specialization. TODO: investigate")
@@ -2181,12 +2225,12 @@ class TestSDPAPatternRegistration(TestCase):
 class TestAttentionFusionDeviceRouting(TestCase):
     hw_classification = HardwareClassification.ACCELERATOR
 
-    def _match_for(self, device):
+    def _match_for(self, device, **extra_kwargs):
         dev = torch.device(device)
         tensor = SimpleNamespace(dtype=torch.float32, device=dev)
         node = SimpleNamespace(meta={"val": tensor})
         return SimpleNamespace(
-            kwargs={"query": node, "key": node, "value": node},
+            kwargs={"query": node, "key": node, "value": node, **extra_kwargs},
             nodes=[],
         )
 
@@ -2221,6 +2265,33 @@ class TestAttentionFusionDeviceRouting(TestCase):
         self.assertEqual(counters["inductor"]["fuse_attention"], 1)
         on_cuda = torch.device(device).type == "cuda" and torch.version.hip is None
         self.assertEqual(sdpa_calls, 0 if on_cuda else 1)
+
+    def test_zero_scale_rejection(self, device):
+        from torch._inductor.fx_passes.fuse_attention import (
+            _sfdp_extra_check,
+            _sfdp_params_check,
+        )
+
+        # The zero check runs before the dtype/precision gates, so any device
+        # rejects 0.0, -0.0 and the int 0 with the flag set. The factory passes
+        # the flag down to _sfdp_params_check, which checks match.kwargs.
+        for inv_scale in (0.0, -0.0, 0):
+            match = self._match_for(device, inv_scale=inv_scale)
+            self.assertFalse(_sfdp_params_check(match, reject_zero_scale=True))
+            self.assertFalse(_sfdp_extra_check(reject_zero_scale=True)(match))
+
+        # A nonzero scale fuses like any other match.
+        match = self._match_for(device, inv_scale=0.5)
+        if torch.device(device).type == "cuda":
+            matmul = torch.backends.cuda.matmul
+            saved = matmul.fp32_precision
+            try:
+                matmul.fp32_precision = "tf32"
+                self.assertTrue(_sfdp_params_check(match, reject_zero_scale=True))
+            finally:
+                matmul.fp32_precision = saved
+        else:
+            self.assertTrue(_sfdp_params_check(match, reject_zero_scale=True))
 
     def test_fp32_fusion_gated_by_precision(self, device):
         from torch._inductor.fx_passes.fuse_attention import _sfdp_params_check
@@ -2286,6 +2357,15 @@ if HAS_XPU_AND_TRITON or (HAS_CUDA_AND_TRITON and PLATFORM_SUPPORTS_FUSED_ATTENT
         )
         test_pattern_fails_with_symfloat_scale_gpu = (
             TestSDPAPatternRewriterTemplate._test_pattern_fails_with_symfloat_scale
+        )
+        test_pattern_fails_with_zero_scale_gpu = (
+            TestSDPAPatternRewriterTemplate._test_pattern_fails_with_zero_scale
+        )
+        test_pattern_fails_with_masked_zero_scale_gpu = (
+            TestSDPAPatternRewriterTemplate._test_pattern_fails_with_masked_zero_scale
+        )
+        test_pattern_fuses_with_mul_zero_scale_gpu = (
+            TestSDPAPatternRewriterTemplate._test_pattern_fuses_with_mul_zero_scale
         )
         test_pattern_fails_with_unsupported_mask_gpu = (
             TestSDPAPatternRewriterTemplate._test_pattern_fails_with_unsupported_mask
@@ -2447,6 +2527,15 @@ if HAS_CPU:
         )
         test_pattern_fails_with_symfloat_scale_cpu = (
             TestSDPAPatternRewriterTemplate._test_pattern_fails_with_symfloat_scale
+        )
+        test_pattern_fails_with_zero_scale_cpu = (
+            TestSDPAPatternRewriterTemplate._test_pattern_fails_with_zero_scale
+        )
+        test_pattern_fails_with_masked_zero_scale_cpu = (
+            TestSDPAPatternRewriterTemplate._test_pattern_fails_with_masked_zero_scale
+        )
+        test_pattern_fuses_with_mul_zero_scale_cpu = (
+            TestSDPAPatternRewriterTemplate._test_pattern_fuses_with_mul_zero_scale
         )
         test_pattern_fails_with_unsupported_mask_cpu = (
             TestSDPAPatternRewriterTemplate._test_pattern_fails_with_unsupported_mask

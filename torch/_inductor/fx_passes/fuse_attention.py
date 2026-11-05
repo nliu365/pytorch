@@ -948,26 +948,29 @@ def _warn_tf32_disabled() -> None:
     )
 
 
+def _scale_value(scale):
+    return scale.meta.get("val") if isinstance(scale, torch.fx.Node) else scale
+
+
 def _is_supported_scale(scale) -> bool:
-    # The matcher may bind the scale to a graph node, whose value lives in
-    # meta["val"]; a node carrying no "val" leaves the scale unknown, so we
-    # conservatively skip the fusion. The fused kernel takes a scalar scale, so
-    # a tensor scale is rejected here. SymFloat scales are tensorified into 0-d
-    # tensors before the joint graph passes run, so they arrive as tensors too;
-    # an untensorified one would land in the same conservative skip.
     # TODO: the scalar behind a tensorified SymFloat scale (e.g. head_dim**0.5
     # under dynamic shapes) could be recovered from the aten.scalar_tensor node
     # to keep the fusion - tracked in #194444.
-    if isinstance(scale, torch.fx.Node):
-        scale = scale.meta.get("val")
-    return isinstance(scale, (float, int, torch.SymInt))
+    return isinstance(_scale_value(scale), (float, int, torch.SymInt))
 
 
-def _sfdp_params_check(match):
+def _is_zero_scale(scale) -> bool:
+    scale = _scale_value(scale)
+    return isinstance(scale, (float, int)) and scale == 0
+
+
+def _sfdp_params_check(match, *, reject_zero_scale=False):
     if not all(k in match.kwargs for k in ("query", "key", "value")):
         raise AssertionError("expected query, key, value in match.kwargs")
     inv_scale = match.kwargs.get("inv_scale")
     if inv_scale is not None and not _is_supported_scale(inv_scale):
+        return False
+    if reject_zero_scale and _is_zero_scale(inv_scale):
         return False
     query = match.kwargs["query"].meta["val"]
     key = match.kwargs["key"].meta["val"]
@@ -1014,7 +1017,10 @@ def _sfdp_params_check(match):
 
 
 def _sfdp_extra_check(
-    scale_factor_op=None, fp32_upcast_softmax=False, math_path_only=False
+    scale_factor_op=None,
+    fp32_upcast_softmax=False,
+    math_path_only=False,
+    reject_zero_scale=False,
 ):
     def fn(match):
         if math_path_only and "query" in match.kwargs:
@@ -1032,7 +1038,11 @@ def _sfdp_extra_check(
             # Note: args[1] of the scale_factor_node is always the scale_factor for the current patterns.
             if not _is_supported_scale(scale_factor_node.args[1]):
                 return False
-        return _sfdp_params_check(match)
+            if scale_factor_op is aten.div.Tensor and _is_zero_scale(
+                scale_factor_node.args[1]
+            ):
+                return False
+        return _sfdp_params_check(match, reject_zero_scale=reject_zero_scale)
 
     return fn
 
@@ -1179,42 +1189,42 @@ def _get_sfdp_patterns(input_device: torch.device | None = None):
                 _sfdp_replacement_5,
                 [g(), g(), g(), b()],
                 s,
-                _sfdp_params_check,
+                _sfdp_extra_check(reject_zero_scale=True),
             ),
             (
                 _sfdp_pattern_6,
                 _sfdp_replacement_6,
                 [g(), g(), g(), b()],
                 sd,
-                _sfdp_params_check,
+                _sfdp_extra_check(reject_zero_scale=True),
             ),
             (
                 _sfdp_pattern_7,
                 _sfdp_replacement_7,
                 [g(), g(), g()],
                 sd,
-                _sfdp_params_check,
+                _sfdp_extra_check(reject_zero_scale=True),
             ),
             (
                 _sfdp_pattern_8,
                 _sfdp_replacement_8,
                 [g(), g(), g()],
                 s,
-                _sfdp_params_check,
+                _sfdp_extra_check(reject_zero_scale=True),
             ),
             (
                 _sfdp_pattern_9,
                 _sfdp_replacement_9,
                 [g(), g(), g()],
                 sd,
-                _sfdp_params_check,
+                _sfdp_extra_check(reject_zero_scale=True),
             ),
             (
                 _sfdp_pattern_10,
                 _sfdp_replacement_10,
                 [g(), g(), g()],
                 s,
-                _sfdp_params_check,
+                _sfdp_extra_check(reject_zero_scale=True),
             ),
             (
                 _sfdp_pattern_11,
@@ -1277,28 +1287,28 @@ def _get_sfdp_patterns(input_device: torch.device | None = None):
                 _sfdp_replacement_18,
                 [g(), g(), g(), m_bool()],
                 sd,
-                _sfdp_params_check,
+                _sfdp_extra_check(reject_zero_scale=True),
             ),
             (
                 _sfdp_pattern_18,
                 _sfdp_replacement_18,
                 [g_bs1(), g_bs1(), g_bs1(), m_bs1_bool()],
                 sd,
-                _sfdp_params_check,
+                _sfdp_extra_check(reject_zero_scale=True),
             ),
             (
                 _sfdp_pattern_19,
                 _sfdp_replacement_19,
                 [g(), g(), g(), b_bool(), b_float()],
                 sd,
-                _sfdp_params_check,
+                _sfdp_extra_check(reject_zero_scale=True),
             ),
             (
                 _sfdp_pattern_20,
                 _sfdp_replacement_20,
                 [g(), g(), g(), m_2d()],
                 sd,
-                _sfdp_params_check,
+                _sfdp_extra_check(reject_zero_scale=True),
             ),
             (
                 _sfdp_pattern_21,

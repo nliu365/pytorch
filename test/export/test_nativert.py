@@ -17,7 +17,7 @@ from torch.nativert.backends._lower_utils import (
 )
 from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
-    skipGPUIf,
+    skipIf,
     skipXPUIf,
 )
 from torch.testing._internal.common_utils import (

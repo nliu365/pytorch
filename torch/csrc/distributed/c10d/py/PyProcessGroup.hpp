@@ -64,6 +64,25 @@ class PyProcessGroup : public ProcessGroup {
 
       return Work::getFuture();
     }
+
+    bool hasFutureResult() const override {
+      pybind11::gil_scoped_acquire gil;
+      return static_cast<bool>(pybind11::get_override(
+          static_cast<const Work*>(this), "get_future_result"));
+    }
+
+    c10::intrusive_ptr<c10::ivalue::Future> getFutureResult() override {
+      // Unwraps the PyFutureWrapper, as getFuture does.
+      pybind11::gil_scoped_acquire gil;
+      auto override = pybind11::get_override(
+          static_cast<const Work*>(this), "get_future_result");
+      if (!override) {
+        return Work::getFutureResult();
+      }
+      py::object o = override();
+      TORCH_CHECK(!o.is_none(), "get_future_result returned None");
+      return o.cast<std::shared_ptr<torch::jit::PythonFutureWrapper>>()->fut;
+    }
   };
 
 #define WORK_OVERRIDE(cname, name, ...)                                       \
